@@ -1,0 +1,21 @@
+astar_drive:
+  ros__parameters:
+    # 첫 번째 페이지의 Pure Pursuit 예제 기본값
+    lookahead_distance: 0.5
+    linear_velocity: 0.1
+    goal_tolerance: 0.2
+    max_angular_velocity: 1.0
+
+    # OccupancyGrid에서 이 값 이상인 셀은 A*가 통과하지 않습니다.
+    occupied_threshold: 50
+
+    # 두 번째 페이지의 YOLOv8 웹캠 예제 설정
+    camera_index: 0
+    yolo_model: yolov8n.pt
+    confidence_threshold: 0.7
+    stop_class: person
+    show_detection: true
+
+    # 카메라 또는 YOLO 모델을 사용할 수 없으면 주행하지 않습니다.
+    require_detector: true
+    control_period: 0.1
