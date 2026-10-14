@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+WORKSPACE=/home/kiki/turtlebot3
+PACKAGE_DIR="$WORKSPACE/src/my_car_astar"
+PARAMS_FILE="$WORKSPACE/install/my_car_astar/share/my_car_astar/config/astar_drive.yaml"
+VENV_SITE_PACKAGES=("$PACKAGE_DIR"/.venv/lib/python*/site-packages)
+
+if [[ ! -d "${VENV_SITE_PACKAGES[0]}" ]]; then
+  echo "가상환경이 없습니다: $PACKAGE_DIR/.venv" >&2
+  exit 1
+fi
+if [[ ! -f "$PARAMS_FILE" ]]; then
+  echo "A* 파라미터 파일이 없습니다: $PARAMS_FILE" >&2
+  echo "my_car_astar를 먼저 빌드하세요." >&2
+  exit 1
+fi
+
+source /opt/ros/humble/setup.bash
+source "$WORKSPACE/install/setup.bash"
+export ROS_DOMAIN_ID=226
+export ROS_LOCALHOST_ONLY=0
+export TURTLEBOT3_MODEL=waffle_pi
+export PYTHONPATH="${VENV_SITE_PACKAGES[0]}:${PYTHONPATH:-}"
+
+for topic in /map /scan /camera/image_raw; do
+  if ! timeout 5 ros2 topic info "$topic" 2>/dev/null \
+      | grep -qE 'Publisher count: [1-9]'; then
+    echo "필수 토픽 발행자가 없습니다: $topic" >&2
+    exit 2
+  fi
+done
+
+cd "$WORKSPACE"
+exec ros2 run my_car_astar astar_drive \
+  --ros-args \
+  --params-file "$PARAMS_FILE" \
+  -p use_sim_time:=false \
+  -p drive_enabled:=false \
+  "$@"

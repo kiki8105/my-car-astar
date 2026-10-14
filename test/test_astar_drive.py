@@ -4,8 +4,10 @@ from types import SimpleNamespace
 from my_car_astar.astar_drive import (
     astar_path,
     front_obstacle_distance,
+    front_obstacle_image_box,
     grid_to_world,
     normalize_angle,
+    next_route_waypoint,
     select_lookahead_index,
     world_to_grid,
 )
@@ -47,6 +49,41 @@ def test_front_obstacle_distance_ignores_obstacle_already_in_map():
         (0.0, 0.0, 0.0),
         map_message,
     ))
+    map_message.data = [0] * 25
+    assert front_obstacle_distance(
+        scan,
+        0.2,
+        (0.0, 0.0, 0.0),
+        map_message,
+    ) == 0.3
+
+
+def test_front_obstacle_distance_ignores_return_next_to_mapped_wall():
+    scan = SimpleNamespace(
+        angle_min=0.1,
+        angle_increment=0.1,
+        range_min=0.12,
+        range_max=3.5,
+        ranges=[0.3],
+    )
+    cells = [0] * 25
+    cells[1 * 5 + 2] = 100
+    map_message = SimpleNamespace(
+        info=SimpleNamespace(
+            origin=SimpleNamespace(position=SimpleNamespace(x=0.0, y=0.0)),
+            resolution=0.1,
+            width=5,
+            height=5,
+        ),
+        data=cells,
+    )
+
+    assert math.isinf(front_obstacle_distance(
+        scan,
+        0.2,
+        (0.0, 0.0, 0.0),
+        map_message,
+    ))
 
 
 def test_front_obstacle_distance_ignores_invalid_returns():
@@ -59,6 +96,45 @@ def test_front_obstacle_distance_ignores_invalid_returns():
     )
 
     assert math.isinf(front_obstacle_distance(scan, 0.2))
+
+
+def test_front_lidar_obstacle_projects_to_red_box_roi():
+    scan = SimpleNamespace(
+        angle_min=0.1,
+        angle_increment=0.1,
+        range_min=0.12,
+        range_max=3.5,
+        ranges=[0.40, 0.41, 3.0, 3.0, 3.0],
+    )
+    half_sqrt = math.sqrt(0.5)
+    transform = SimpleNamespace(transform=SimpleNamespace(
+        translation=SimpleNamespace(x=0.0, y=-0.029, z=-0.14),
+        rotation=SimpleNamespace(
+            x=half_sqrt,
+            y=-half_sqrt,
+            z=half_sqrt,
+            w=half_sqrt,
+        ),
+    ))
+    camera_info = SimpleNamespace(
+        width=640,
+        height=480,
+        k=[530.4669, 0.0, 320.5, 0.0, 530.4669, 240.5, 0.0, 0.0, 1.0],
+    )
+
+    box = front_obstacle_image_box(
+        scan,
+        0.40,
+        camera_info,
+        transform,
+        0.35,
+    )
+
+    assert box is not None
+    x1, y1, x2, y2 = box
+    assert 0 <= x1 < x2 < camera_info.width
+    assert 0 <= y1 < y2 < camera_info.height
+    assert x2 < camera_info.k[2]
 
 
 def test_astar_finds_path_on_empty_map():
@@ -132,3 +208,11 @@ def test_select_lookahead_returns_goal_when_remaining_path_is_short():
     path = [(0.0, 0.0), (0.2, 0.0)]
     index = select_lookahead_index(path, (0.1, 0.0), 0.5)
     assert index == 1
+
+
+def test_multi_goal_route_advances_in_order_then_completes():
+    goals = [(1.0, 0.0), (2.0, 0.0), (2.0, 1.0)]
+
+    assert next_route_waypoint(goals, 0) == (1, (2.0, 0.0))
+    assert next_route_waypoint(goals, 1) == (2, (2.0, 1.0))
+    assert next_route_waypoint(goals, 2) is None

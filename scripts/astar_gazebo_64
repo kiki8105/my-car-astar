@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+WORKSPACE=/home/kiki/turtlebot3
+source /opt/ros/humble/setup.bash
+source "$WORKSPACE/install/setup.bash"
+source /usr/share/gazebo/setup.sh
+
+export ROS_DOMAIN_ID=64
+export ROS_LOCALHOST_ONLY=0
+export TURTLEBOT3_MODEL=waffle_pi
+export GAZEBO_MODEL_PATH="$WORKSPACE/install/turtlebot3_gazebo/share/turtlebot3_gazebo/models:${GAZEBO_MODEL_PATH:-}"
+
+cd "$WORKSPACE"
+exec ros2 launch turtlebot3_gazebo turtlebot3_house.launch.py "$@"

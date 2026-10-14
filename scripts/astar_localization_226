@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+WORKSPACE=/home/kiki/turtlebot3
+MAP_FILE="${MAP_FILE:-$WORKSPACE/maps/fence_obstacle/map.yaml}"
+PARAMS_FILE="$WORKSPACE/install/turtlebot3_navigation2/share/turtlebot3_navigation2/param/humble/waffle_pi.yaml"
+
+for required in "$MAP_FILE" "$PARAMS_FILE"; do
+  if [[ ! -f "$required" ]]; then
+    echo "필수 파일이 없습니다: $required" >&2
+    exit 1
+  fi
+done
+
+source /opt/ros/humble/setup.bash
+source "$WORKSPACE/install/setup.bash"
+export ROS_DOMAIN_ID=226
+export ROS_LOCALHOST_ONLY=0
+export TURTLEBOT3_MODEL=waffle_pi
+
+if timeout 5 ros2 topic info /clock 2>/dev/null \
+    | grep -qE 'Publisher count: [1-9]'; then
+  echo "Domain 226에서 /clock 발행자가 발견됐습니다. Gazebo를 종료하세요." >&2
+  exit 2
+fi
+
+cd "$WORKSPACE"
+exec ros2 launch nav2_bringup localization_launch.py \
+  map:="$MAP_FILE" \
+  params_file:="$PARAMS_FILE" \
+  use_sim_time:=false \
+  autostart:=true \
+  "$@"

@@ -16,11 +16,13 @@ import time
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import rclpy
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
+from geometry_msgs.msg import PoseArray, PoseStamped, PoseWithCovarianceStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
-from sensor_msgs.msg import Image, LaserScan
+from rclpy.time import Time
+from sensor_msgs.msg import CameraInfo, Image, LaserScan
+from tf2_ros import Buffer, TransformException, TransformListener
 
 
 GridPoint = Tuple[int, int]
@@ -43,6 +45,7 @@ def front_obstacle_distance(
     map_message: Optional[OccupancyGrid] = None,
     occupied_threshold: int = 50,
     sensor_offset: float = 0.064,
+    mapped_obstacle_tolerance: float = 0.12,
 ) -> float:
     """Return the nearest forward return not already represented as occupied."""
     if scan.angle_increment == 0.0:
@@ -71,12 +74,117 @@ def front_obstacle_distance(
                     origin,
                     info.resolution,
                 )
-                if 0 <= cell_x < info.width and 0 <= cell_y < info.height:
-                    cell_value = map_message.data[cell_y * info.width + cell_x]
-                    if cell_value >= occupied_threshold:
+                if info.resolution > 0.0:
+                    tolerance_cells = math.ceil(
+                        mapped_obstacle_tolerance / info.resolution
+                    )
+                    occupied_nearby = False
+                    for offset_y in range(
+                        -tolerance_cells,
+                        tolerance_cells + 1,
+                    ):
+                        for offset_x in range(
+                            -tolerance_cells,
+                            tolerance_cells + 1,
+                        ):
+                            if (
+                                offset_x * offset_x + offset_y * offset_y
+                                > tolerance_cells * tolerance_cells
+                            ):
+                                continue
+                            neighbor_x = cell_x + offset_x
+                            neighbor_y = cell_y + offset_y
+                            if not (
+                                0 <= neighbor_x < info.width
+                                and 0 <= neighbor_y < info.height
+                            ):
+                                continue
+                            cell_value = map_message.data[
+                                neighbor_y * info.width + neighbor_x
+                            ]
+                            if cell_value >= occupied_threshold:
+                                occupied_nearby = True
+                                break
+                        if occupied_nearby:
+                            break
+                    if occupied_nearby:
                         continue
             distances.append(distance)
     return min(distances, default=math.inf)
+
+
+def front_obstacle_image_box(
+    scan: LaserScan,
+    nearest_distance: float,
+    camera_info: CameraInfo,
+    transform,
+    half_angle: float,
+    obstacle_height: float = 0.4,
+    lidar_height: float = 0.121,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Project the nearest LiDAR return cluster through TF and camera intrinsics."""
+    nearby_returns = []
+    for index, distance in enumerate(scan.ranges):
+        angle = normalize_angle(scan.angle_min + index * scan.angle_increment)
+        if (
+            math.isfinite(distance)
+            and scan.range_min <= distance <= scan.range_max
+            and abs(angle) <= half_angle
+            and abs(distance - nearest_distance) <= 0.12
+        ):
+            nearby_returns.append((distance, angle))
+    if not nearby_returns:
+        nearby_returns.append((nearest_distance, 0.0))
+
+    rotation = transform.transform.rotation
+    translation = transform.transform.translation
+    qx, qy, qz, qw = rotation.x, rotation.y, rotation.z, rotation.w
+    camera_points = []
+    for distance, angle in nearby_returns:
+        scan_x = distance * math.cos(angle)
+        scan_y = distance * math.sin(angle)
+        for scan_z in (-lidar_height, obstacle_height - lidar_height):
+            cross_x = 2.0 * (qy * scan_z - qz * scan_y)
+            cross_y = 2.0 * (qz * scan_x - qx * scan_z)
+            cross_z = 2.0 * (qx * scan_y - qy * scan_x)
+            camera_x = (
+                scan_x + qw * cross_x + qy * cross_z - qz * cross_y
+                + translation.x
+            )
+            camera_y = (
+                scan_y + qw * cross_y + qz * cross_x - qx * cross_z
+                + translation.y
+            )
+            camera_z = (
+                scan_z + qw * cross_z + qx * cross_y - qy * cross_x
+                + translation.z
+            )
+            if camera_z <= 0.01:
+                continue
+            k = camera_info.k
+            pixel_x = (k[0] * camera_x + k[1] * camera_y) / camera_z + k[2]
+            pixel_y = (k[3] * camera_x + k[4] * camera_y) / camera_z + k[5]
+            if (
+                -camera_info.width <= pixel_x <= 2 * camera_info.width
+                and -camera_info.height <= pixel_y <= 2 * camera_info.height
+            ):
+                camera_points.append((pixel_x, pixel_y))
+
+    if not camera_points:
+        return None
+
+    padding = 8
+    x1 = max(0, math.floor(min(point[0] for point in camera_points)) - padding)
+    y1 = max(0, math.floor(min(point[1] for point in camera_points)) - padding)
+    x2 = min(
+        camera_info.width - 1,
+        math.ceil(max(point[0] for point in camera_points)) + padding,
+    )
+    y2 = min(
+        camera_info.height - 1,
+        math.ceil(max(point[1] for point in camera_points)) + padding,
+    )
+    return (x1, y1, x2, y2) if x1 < x2 and y1 < y2 else None
 
 
 def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
@@ -245,6 +353,17 @@ def select_lookahead_index(
     return len(path) - 1
 
 
+def next_route_waypoint(
+    goals: Sequence[WorldPoint],
+    current_index: int,
+) -> Optional[Tuple[int, WorldPoint]]:
+    """Return the next ordered goal, or None when the route is complete."""
+    next_index = current_index + 1
+    if next_index >= len(goals):
+        return None
+    return next_index, goals[next_index]
+
+
 class AStarDrive(Node):
     """Plan with A*, follow with Pure Pursuit, and stop on YOLO detection."""
 
@@ -259,27 +378,46 @@ class AStarDrive(Node):
         self.declare_parameter('robot_radius', 0.2)
         self.declare_parameter('obstacle_stop_distance', 0.45)
         self.declare_parameter('obstacle_front_angle', 0.35)
+        self.declare_parameter('mapped_obstacle_tolerance', 0.12)
         self.declare_parameter('scan_timeout', 1.0)
         self.declare_parameter('image_topic', '/camera/image_raw')
+        self.declare_parameter('annotated_image_topic', '/yolo/annotated_image')
+        self.declare_parameter('obstacle_bbox_height', 0.4)
+        self.declare_parameter('lidar_height_above_ground', 0.121)
         self.declare_parameter('yolo_model', 'yolov8n.pt')
         self.declare_parameter('confidence_threshold', 0.7)
-        self.declare_parameter('stop_class', 'person')
         self.declare_parameter('show_detection', True)
         self.declare_parameter('require_detector', True)
+        self.declare_parameter('drive_enabled', True)
         self.declare_parameter('control_period', 0.1)
 
         self.map_message: Optional[OccupancyGrid] = None
         self.current_pose: Optional[Tuple[float, float, float]] = None
         self.goal: Optional[WorldPoint] = None
+        self.goals: List[WorldPoint] = []
+        self.goal_index = 0
         self.path: List[WorldPoint] = []
         self.path_index = 0
+        self.drive_was_enabled = True
         self.stop_object_visible = False
         self.latest_scan: Optional[LaserScan] = None
         self.last_scan_received_at: Optional[float] = None
         self.scan_stop_active = False
+        self.latest_image_header = None
+        self.latest_camera_info: Optional[CameraInfo] = None
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.cmd_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
         self.path_publisher = self.create_publisher(Path, '/planned_path', 10)
+        annotated_topic = str(
+            self.get_parameter('annotated_image_topic').value
+        )
+        self.annotated_image_publisher = self.create_publisher(
+            Image,
+            annotated_topic,
+            qos_profile_sensor_data,
+        )
         self.latest_frame = None
         self.bridge = None
         self.create_subscription(
@@ -295,11 +433,18 @@ class AStarDrive(Node):
             10,
         )
         self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
+        self.create_subscription(PoseArray, '/goal_poses', self.goals_callback, 10)
         image_topic = str(self.get_parameter('image_topic').value)
         self.create_subscription(
             Image,
             image_topic,
             self.image_callback,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            CameraInfo,
+            '/camera/camera_info',
+            self.camera_info_callback,
             qos_profile_sensor_data,
         )
         self.create_subscription(
@@ -341,7 +486,7 @@ class AStarDrive(Node):
             self.detector = YOLO(model_path)
             image_topic = str(self.get_parameter('image_topic').value)
             self.get_logger().info(
-                f'YOLOv8={model_path}, Gazebo image topic={image_topic} 준비 완료'
+                f'YOLOv8={model_path}, camera image topic={image_topic} 준비 완료'
             )
         except Exception as error:
             self.cv2 = None
@@ -353,6 +498,7 @@ class AStarDrive(Node):
         if self.bridge is None:
             return
         try:
+            self.latest_image_header = message.header
             self.latest_frame = self.bridge.imgmsg_to_cv2(
                 message,
                 desired_encoding='bgr8',
@@ -363,6 +509,9 @@ class AStarDrive(Node):
     def scan_callback(self, message: LaserScan) -> None:
         self.latest_scan = message
         self.last_scan_received_at = time.monotonic()
+
+    def camera_info_callback(self, message: CameraInfo) -> None:
+        self.latest_camera_info = message
 
     def map_callback(self, message: OccupancyGrid) -> None:
         self.map_message = message
@@ -382,11 +531,31 @@ class AStarDrive(Node):
             self.plan_path()
 
     def goal_callback(self, message: PoseStamped) -> None:
-        self.goal = (message.pose.position.x, message.pose.position.y)
+        self.goals = [(message.pose.position.x, message.pose.position.y)]
+        self.goal_index = 0
+        self.goal = self.goals[0]
         self.path = []
         self.path_index = 0
         self.get_logger().info(
             f'새 목표 수신: x={self.goal[0]:.2f}, y={self.goal[1]:.2f}'
+        )
+        self.plan_path()
+
+    def goals_callback(self, message: PoseArray) -> None:
+        if not message.poses:
+            self.get_logger().warning('빈 A* 경유점 목록은 무시합니다.')
+            return
+
+        self.goals = [
+            (pose.position.x, pose.position.y)
+            for pose in message.poses
+        ]
+        self.goal_index = 0
+        self.goal = self.goals[0]
+        self.path = []
+        self.path_index = 0
+        self.get_logger().info(
+            f'A* 다중 경로 수신: {len(self.goals)}개 경유점'
         )
         self.plan_path()
 
@@ -444,24 +613,125 @@ class AStarDrive(Node):
             message.poses.append(pose)
         self.path_publisher.publish(message)
 
-    def detect_stop_object(self) -> bool:
+    def detect_stop_object(
+        self,
+        lidar_distance: Optional[float] = None,
+        safety_warning: Optional[str] = None,
+    ) -> bool:
         if not self.detector_ready or self.latest_frame is None:
             return False
 
         frame = self.latest_frame
         confidence = float(self.get_parameter('confidence_threshold').value)
-        stop_class = str(self.get_parameter('stop_class').value)
         results = self.detector(frame, stream=True, conf=confidence, verbose=False)
         detected = False
-        display_frame = frame
+        display_frame = frame.copy()
+        detected_classes = set()
 
         for result in results:
             for box in result.boxes:
                 class_id = int(box.cls[0])
                 class_name = self.detector.names[class_id]
-                if class_name == stop_class:
-                    detected = True
-            display_frame = result.plot()
+                box_confidence = float(box.conf[0])
+                x1, y1, x2, y2 = (
+                    int(value) for value in box.xyxy[0].tolist()
+                )
+                label = f'{class_name} {box_confidence:.2f}'
+                self.cv2.rectangle(
+                    display_frame,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 0, 255),
+                    2,
+                )
+                self.cv2.putText(
+                    display_frame,
+                    label,
+                    (x1, max(18, y1 - 6)),
+                    self.cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 255),
+                    2,
+                    self.cv2.LINE_AA,
+                )
+                detected = True
+                detected_classes.add(class_name)
+
+        if lidar_distance is not None:
+            box = None
+            if self.latest_scan is not None and self.latest_camera_info is not None:
+                try:
+                    transform = self.tf_buffer.lookup_transform(
+                        self.latest_camera_info.header.frame_id,
+                        self.latest_scan.header.frame_id,
+                        Time(),
+                    )
+                    box = front_obstacle_image_box(
+                        self.latest_scan,
+                        lidar_distance,
+                        self.latest_camera_info,
+                        transform,
+                        float(self.get_parameter('obstacle_front_angle').value),
+                        float(self.get_parameter('obstacle_bbox_height').value),
+                        float(self.get_parameter('lidar_height_above_ground').value),
+                    )
+                except TransformException as error:
+                    self.get_logger().warning(
+                        f'LiDAR bbox TF 변환 실패: {error}',
+                        throttle_duration_sec=2.0,
+                    )
+
+            if box is not None:
+                x1, y1, x2, y2 = box
+                self.cv2.rectangle(
+                    display_frame,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 0, 255),
+                    3,
+                )
+                label = f'OBSTACLE / EMERGENCY STOP {lidar_distance:.2f}m'
+                self.cv2.putText(
+                    display_frame,
+                    label,
+                    (x1, max(20, y1 - 8)),
+                    self.cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 0, 255),
+                    2,
+                    self.cv2.LINE_AA,
+                )
+            else:
+                safety_warning = (
+                    f'LIDAR OBSTACLE / EMERGENCY STOP {lidar_distance:.2f}m'
+                )
+        if safety_warning is not None:
+            frame_height, frame_width = display_frame.shape[:2]
+            self.cv2.rectangle(
+                display_frame,
+                (2, 2),
+                (frame_width - 3, frame_height - 3),
+                (0, 0, 255),
+                3,
+            )
+            self.cv2.putText(
+                display_frame,
+                safety_warning,
+                (12, 28),
+                self.cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 255),
+                2,
+                self.cv2.LINE_AA,
+            )
+
+        annotated_message = self.bridge.cv2_to_imgmsg(
+            display_frame,
+            encoding='bgr8',
+        )
+        if self.latest_image_header is not None:
+            annotated_message.header = self.latest_image_header
+        self.annotated_image_publisher.publish(annotated_message)
 
         if bool(self.get_parameter('show_detection').value):
             self.cv2.imshow('YOLOv8 emergency stop', display_frame)
@@ -469,15 +739,27 @@ class AStarDrive(Node):
 
         if detected != self.stop_object_visible:
             if detected:
+                class_summary = ', '.join(sorted(detected_classes))
                 self.get_logger().warning(
-                    f'{stop_class} 검출: 비상정지 cmd_vel을 발행합니다.'
+                    f'객체 검출 ({class_summary}): 비상정지 cmd_vel을 발행합니다.'
                 )
             else:
-                self.get_logger().info(f'{stop_class}이 화면에서 사라졌습니다.')
+                self.get_logger().info('검출 객체가 화면에서 사라졌습니다.')
         self.stop_object_visible = detected
         return detected
 
     def control_loop(self) -> None:
+        if not bool(self.get_parameter('drive_enabled').value):
+            if self.drive_was_enabled:
+                self.stop_robot()
+                self.get_logger().info(
+                    '수동 조종을 위해 A* 자동주행을 정지했습니다.'
+                )
+            self.drive_was_enabled = False
+            self.detect_stop_object()
+            return
+        self.drive_was_enabled = True
+
         require_detector = bool(self.get_parameter('require_detector').value)
         if require_detector and not self.detector_ready:
             self.stop_robot()
@@ -490,6 +772,7 @@ class AStarDrive(Node):
             or time.monotonic() - self.last_scan_received_at > scan_timeout
         ):
             self.stop_robot()
+            self.detect_stop_object(safety_warning='LIDAR LOST - EMERGENCY STOP')
             self.get_logger().warning(
                 '/scan 수신이 없거나 오래되어 안전 정지합니다.',
                 throttle_duration_sec=2.0,
@@ -502,6 +785,9 @@ class AStarDrive(Node):
             self.current_pose,
             self.map_message,
             int(self.get_parameter('occupied_threshold').value),
+            mapped_obstacle_tolerance=float(
+                self.get_parameter('mapped_obstacle_tolerance').value
+            ),
         )
         stop_distance = float(
             self.get_parameter('obstacle_stop_distance').value
@@ -509,6 +795,7 @@ class AStarDrive(Node):
         if obstacle_distance <= stop_distance:
             self.stop_robot()
             self.scan_stop_active = True
+            self.detect_stop_object(lidar_distance=obstacle_distance)
             self.get_logger().warning(
                 f'전방 장애물 {obstacle_distance:.2f} m: 안전 정지합니다.',
                 throttle_duration_sec=1.0,
@@ -533,8 +820,22 @@ class AStarDrive(Node):
         )
         if goal_distance < float(self.get_parameter('goal_tolerance').value):
             self.stop_robot()
+            next_waypoint = next_route_waypoint(
+                self.goals,
+                self.goal_index,
+            )
+            if next_waypoint is not None:
+                self.goal_index, self.goal = next_waypoint
+                self.path = []
+                self.path_index = 0
+                self.get_logger().info(
+                    f'A* 경유점 {self.goal_index}/{len(self.goals)} 도착. '
+                    '다음 경유점 경로를 계산합니다.'
+                )
+                self.plan_path()
+                return
             self.get_logger().info(
-                '목표에 도착했습니다.',
+                '모든 A* 경유점에 도착했습니다.',
                 throttle_duration_sec=2.0,
             )
             return

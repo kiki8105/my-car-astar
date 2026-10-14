@@ -14,15 +14,19 @@ astar_drive:
     # 지도상 자유 공간에서 새로 발견된 전방 장애물만 안전 정지합니다.
     obstacle_stop_distance: 0.45
     obstacle_front_angle: 0.35
+    mapped_obstacle_tolerance: 0.12
     scan_timeout: 1.0
 
     # TurtleBot3 Waffle Pi Gazebo 카메라 이미지 토픽
     image_topic: /camera/image_raw
+    annotated_image_topic: /yolo/annotated_image
+    obstacle_bbox_height: 0.4
+    lidar_height_above_ground: 0.121
     yolo_model: yolov8n.pt
     confidence_threshold: 0.7
-    stop_class: person
     show_detection: true
 
     # 카메라 또는 YOLO 모델을 사용할 수 없으면 주행하지 않습니다.
     require_detector: true
+    drive_enabled: true
     control_period: 0.1

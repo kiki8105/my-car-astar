@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+WORKSPACE=/home/kiki/turtlebot3
+MAP_FILE="${MAP_FILE:-$WORKSPACE/maps/patrol_20260930_133038/map.yaml}"
+PARAMS_FILE="$WORKSPACE/install/turtlebot3_navigation2/share/turtlebot3_navigation2/param/humble/waffle_pi.yaml"
+
+if [[ ! -f "$MAP_FILE" ]]; then
+  echo "지도 파일이 없습니다: $MAP_FILE" >&2
+  echo "MAP_FILE=/절대경로/map.yaml ./scripts/astar_localization_64 로 다른 지도를 지정하세요." >&2
+  exit 1
+fi
+if [[ ! -f "$PARAMS_FILE" ]]; then
+  echo "Nav2 파라미터 파일이 없습니다: $PARAMS_FILE" >&2
+  echo "먼저 워크스페이스를 빌드하세요." >&2
+  exit 1
+fi
+
+source /opt/ros/humble/setup.bash
+source "$WORKSPACE/install/setup.bash"
+export ROS_DOMAIN_ID=64
+export ROS_LOCALHOST_ONLY=0
+export TURTLEBOT3_MODEL=waffle_pi
+
+cd "$WORKSPACE"
+exec ros2 launch nav2_bringup localization_launch.py \
+  map:="$MAP_FILE" \
+  params_file:="$PARAMS_FILE" \
+  use_sim_time:=true \
+  autostart:=true \
+  "$@"
