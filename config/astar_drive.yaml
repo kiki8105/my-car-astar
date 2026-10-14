@@ -8,9 +8,16 @@ astar_drive:
 
     # OccupancyGrid에서 이 값 이상인 셀은 A*가 통과하지 않습니다.
     occupied_threshold: 50
+    # 차체 반경과 여유를 포함해 점유 셀 주변 경로도 차단합니다.
+    robot_radius: 0.2
 
-    # 두 번째 페이지의 YOLOv8 웹캠 예제 설정
-    camera_index: 0
+    # 지도상 자유 공간에서 새로 발견된 전방 장애물만 안전 정지합니다.
+    obstacle_stop_distance: 0.45
+    obstacle_front_angle: 0.35
+    scan_timeout: 1.0
+
+    # TurtleBot3 Waffle Pi Gazebo 카메라 이미지 토픽
+    image_topic: /camera/image_raw
     yolo_model: yolov8n.pt
     confidence_threshold: 0.7
     stop_class: person

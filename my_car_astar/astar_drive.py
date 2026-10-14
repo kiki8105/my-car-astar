@@ -4,20 +4,23 @@
 The implementation follows the two supplied course pages:
 * OccupancyGrid, current pose, and goal are combined into one A* driving node.
 * The generated path is followed with the Pure Pursuit steering formula.
-* YOLOv8 reads a webcam frame and forces cmd_vel to zero when the selected
-  object is detected.
+* Mapped obstacles receive robot-clearance inflation; unexpected LiDAR returns
+    and selected YOLO detections force cmd_vel to zero.
 """
 
 from __future__ import annotations
 
 import heapq
 import math
+import time
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
+from sensor_msgs.msg import Image, LaserScan
 
 
 GridPoint = Tuple[int, int]
@@ -31,6 +34,49 @@ def normalize_angle(angle: float) -> float:
     while angle < -math.pi:
         angle += 2.0 * math.pi
     return angle
+
+
+def front_obstacle_distance(
+    scan: LaserScan,
+    half_angle: float,
+    pose: Optional[Tuple[float, float, float]] = None,
+    map_message: Optional[OccupancyGrid] = None,
+    occupied_threshold: int = 50,
+    sensor_offset: float = 0.064,
+) -> float:
+    """Return the nearest forward return not already represented as occupied."""
+    if scan.angle_increment == 0.0:
+        return math.inf
+
+    distances = []
+    for index, distance in enumerate(scan.ranges):
+        angle = normalize_angle(scan.angle_min + index * scan.angle_increment)
+        if abs(angle) > half_angle:
+            continue
+        if (
+            math.isfinite(distance)
+            and scan.range_min <= distance <= scan.range_max
+        ):
+            if pose is not None and map_message is not None:
+                sensor_x = pose[0] - sensor_offset * math.cos(pose[2])
+                sensor_y = pose[1] - sensor_offset * math.sin(pose[2])
+                hit = (
+                    sensor_x + distance * math.cos(pose[2] + angle),
+                    sensor_y + distance * math.sin(pose[2] + angle),
+                )
+                info = map_message.info
+                origin = (info.origin.position.x, info.origin.position.y)
+                cell_x, cell_y = world_to_grid(
+                    hit,
+                    origin,
+                    info.resolution,
+                )
+                if 0 <= cell_x < info.width and 0 <= cell_y < info.height:
+                    cell_value = map_message.data[cell_y * info.width + cell_x]
+                    if cell_value >= occupied_threshold:
+                        continue
+            distances.append(distance)
+    return min(distances, default=math.inf)
 
 
 def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
@@ -94,6 +140,7 @@ def astar_path(
     start: GridPoint,
     goal: GridPoint,
     occupied_threshold: int = 50,
+    clearance_cells: int = 0,
 ) -> List[GridPoint]:
     """Find a minimum-cost path through an OccupancyGrid using heapq.
 
@@ -109,8 +156,18 @@ def astar_path(
     def is_free(cell: GridPoint) -> bool:
         if not in_bounds(cell):
             return False
-        value = data[cell[1] * width + cell[0]]
-        return 0 <= value < occupied_threshold
+        radius_squared = clearance_cells * clearance_cells
+        for dy in range(-clearance_cells, clearance_cells + 1):
+            for dx in range(-clearance_cells, clearance_cells + 1):
+                if dx * dx + dy * dy > radius_squared:
+                    continue
+                neighbor = (cell[0] + dx, cell[1] + dy)
+                if not in_bounds(neighbor):
+                    return False
+                value = data[neighbor[1] * width + neighbor[0]]
+                if value < 0 or value >= occupied_threshold:
+                    return False
+        return True
 
     if not is_free(start) or not is_free(goal):
         return []
@@ -199,7 +256,11 @@ class AStarDrive(Node):
         self.declare_parameter('goal_tolerance', 0.2)
         self.declare_parameter('max_angular_velocity', 1.0)
         self.declare_parameter('occupied_threshold', 50)
-        self.declare_parameter('camera_index', 0)
+        self.declare_parameter('robot_radius', 0.2)
+        self.declare_parameter('obstacle_stop_distance', 0.45)
+        self.declare_parameter('obstacle_front_angle', 0.35)
+        self.declare_parameter('scan_timeout', 1.0)
+        self.declare_parameter('image_topic', '/camera/image_raw')
         self.declare_parameter('yolo_model', 'yolov8n.pt')
         self.declare_parameter('confidence_threshold', 0.7)
         self.declare_parameter('stop_class', 'person')
@@ -213,10 +274,20 @@ class AStarDrive(Node):
         self.path: List[WorldPoint] = []
         self.path_index = 0
         self.stop_object_visible = False
+        self.latest_scan: Optional[LaserScan] = None
+        self.last_scan_received_at: Optional[float] = None
+        self.scan_stop_active = False
 
         self.cmd_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
         self.path_publisher = self.create_publisher(Path, '/planned_path', 10)
-        self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
+        self.latest_frame = None
+        self.bridge = None
+        self.create_subscription(
+            OccupancyGrid,
+            '/map',
+            self.map_callback,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
         self.create_subscription(
             PoseWithCovarianceStamped,
             '/amcl_pose',
@@ -224,6 +295,19 @@ class AStarDrive(Node):
             10,
         )
         self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
+        image_topic = str(self.get_parameter('image_topic').value)
+        self.create_subscription(
+            Image,
+            image_topic,
+            self.image_callback,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.scan_callback,
+            qos_profile_sensor_data,
+        )
 
         self.cv2 = None
         self.detector = None
@@ -241,32 +325,44 @@ class AStarDrive(Node):
         return (
             self.cv2 is not None
             and self.detector is not None
-            and self.camera is not None
-            and self.camera.isOpened()
+            and self.bridge is not None
+            and self.latest_frame is not None
         )
 
     def _initialize_detector(self) -> None:
         try:
             import cv2
+            from cv_bridge import CvBridge
             from ultralytics import YOLO
 
-            camera_index = int(self.get_parameter('camera_index').value)
             model_path = str(self.get_parameter('yolo_model').value)
             self.cv2 = cv2
+            self.bridge = CvBridge()
             self.detector = YOLO(model_path)
-            self.camera = cv2.VideoCapture(camera_index)
-            if not self.camera.isOpened():
-                raise RuntimeError(f'웹캠 {camera_index}을 열 수 없습니다.')
+            image_topic = str(self.get_parameter('image_topic').value)
             self.get_logger().info(
-                f'YOLOv8={model_path}, webcam={camera_index} 준비 완료'
+                f'YOLOv8={model_path}, Gazebo image topic={image_topic} 준비 완료'
             )
         except Exception as error:
             self.cv2 = None
             self.detector = None
-            if self.camera is not None:
-                self.camera.release()
-            self.camera = None
+            self.bridge = None
             self.get_logger().error(f'객체 검출 초기화 실패: {error}')
+
+    def image_callback(self, message: Image) -> None:
+        if self.bridge is None:
+            return
+        try:
+            self.latest_frame = self.bridge.imgmsg_to_cv2(
+                message,
+                desired_encoding='bgr8',
+            )
+        except Exception as error:
+            self.get_logger().warning(f'Gazebo 카메라 이미지 변환 실패: {error}')
+
+    def scan_callback(self, message: LaserScan) -> None:
+        self.latest_scan = message
+        self.last_scan_received_at = time.monotonic()
 
     def map_callback(self, message: OccupancyGrid) -> None:
         self.map_message = message
@@ -313,6 +409,15 @@ class AStarDrive(Node):
             start_cell,
             goal_cell,
             int(self.get_parameter('occupied_threshold').value),
+            clearance_cells=(
+                math.ceil(
+                    float(self.get_parameter('robot_radius').value)
+                    / info.resolution
+                    + math.sqrt(2.0) / 2.0
+                )
+                if float(self.get_parameter('robot_radius').value) > 0.0
+                else 0
+            ),
         )
 
         if not cells:
@@ -340,14 +445,10 @@ class AStarDrive(Node):
         self.path_publisher.publish(message)
 
     def detect_stop_object(self) -> bool:
-        if not self.detector_ready:
+        if not self.detector_ready or self.latest_frame is None:
             return False
 
-        success, frame = self.camera.read()
-        if not success:
-            self.get_logger().warning('웹캠 프레임을 읽지 못했습니다.')
-            return False
-
+        frame = self.latest_frame
         confidence = float(self.get_parameter('confidence_threshold').value)
         stop_class = str(self.get_parameter('stop_class').value)
         results = self.detector(frame, stream=True, conf=confidence, verbose=False)
@@ -381,6 +482,41 @@ class AStarDrive(Node):
         if require_detector and not self.detector_ready:
             self.stop_robot()
             return
+
+        scan_timeout = float(self.get_parameter('scan_timeout').value)
+        if (
+            self.latest_scan is None
+            or self.last_scan_received_at is None
+            or time.monotonic() - self.last_scan_received_at > scan_timeout
+        ):
+            self.stop_robot()
+            self.get_logger().warning(
+                '/scan 수신이 없거나 오래되어 안전 정지합니다.',
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        obstacle_distance = front_obstacle_distance(
+            self.latest_scan,
+            float(self.get_parameter('obstacle_front_angle').value),
+            self.current_pose,
+            self.map_message,
+            int(self.get_parameter('occupied_threshold').value),
+        )
+        stop_distance = float(
+            self.get_parameter('obstacle_stop_distance').value
+        )
+        if obstacle_distance <= stop_distance:
+            self.stop_robot()
+            self.scan_stop_active = True
+            self.get_logger().warning(
+                f'전방 장애물 {obstacle_distance:.2f} m: 안전 정지합니다.',
+                throttle_duration_sec=1.0,
+            )
+            return
+        if self.scan_stop_active:
+            self.scan_stop_active = False
+            self.get_logger().info('전방 장애물이 사라져 주행을 재개합니다.')
 
         if self.detect_stop_object():
             self.stop_robot()
@@ -431,8 +567,6 @@ class AStarDrive(Node):
 
     def close(self) -> None:
         self.stop_robot()
-        if self.camera is not None:
-            self.camera.release()
         if self.cv2 is not None:
             self.cv2.destroyAllWindows()
 

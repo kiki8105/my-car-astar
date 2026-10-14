@@ -1,12 +1,64 @@
 import math
+from types import SimpleNamespace
 
 from my_car_astar.astar_drive import (
     astar_path,
+    front_obstacle_distance,
     grid_to_world,
     normalize_angle,
     select_lookahead_index,
     world_to_grid,
 )
+
+
+def test_front_obstacle_distance_uses_only_forward_sector():
+    scan = SimpleNamespace(
+        angle_min=-math.pi,
+        angle_increment=math.pi / 2,
+        range_min=0.12,
+        range_max=3.5,
+        ranges=[0.2, 1.2, 0.3, 0.8, 0.4],
+    )
+
+    assert front_obstacle_distance(scan, 0.4) == 0.3
+
+
+def test_front_obstacle_distance_ignores_obstacle_already_in_map():
+    scan = SimpleNamespace(
+        angle_min=-0.1,
+        angle_increment=0.1,
+        range_min=0.12,
+        range_max=3.5,
+        ranges=[math.inf, 0.3, math.inf],
+    )
+    map_message = SimpleNamespace(
+        info=SimpleNamespace(
+            origin=SimpleNamespace(position=SimpleNamespace(x=-1.0, y=-1.0)),
+            resolution=1.0,
+            width=3,
+            height=3,
+        ),
+        data=[0, 0, 0, 0, 100, 0, 0, 0, 0],
+    )
+
+    assert math.isinf(front_obstacle_distance(
+        scan,
+        0.2,
+        (0.0, 0.0, 0.0),
+        map_message,
+    ))
+
+
+def test_front_obstacle_distance_ignores_invalid_returns():
+    scan = SimpleNamespace(
+        angle_min=-0.1,
+        angle_increment=0.1,
+        range_min=0.12,
+        range_max=3.5,
+        ranges=[math.nan, 0.05, math.inf],
+    )
+
+    assert math.isinf(front_obstacle_distance(scan, 0.2))
 
 
 def test_astar_finds_path_on_empty_map():
@@ -44,6 +96,19 @@ def test_astar_does_not_cut_blocked_corner():
     grid[3] = 100
 
     assert astar_path(grid, 3, 3, (0, 0), (2, 2)) == []
+
+
+def test_astar_keeps_clearance_around_obstacles():
+    grid = [0] * 49
+    grid[3 * 7 + 3] = 100
+
+    path = astar_path(grid, 7, 7, (1, 3), (5, 3), clearance_cells=1)
+
+    assert path
+    assert all(
+        math.hypot(cell[0] - 3, cell[1] - 3) > 1
+        for cell in path
+    )
 
 
 def test_world_grid_conversion_uses_cell_centers():
